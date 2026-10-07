@@ -49,3 +49,4 @@ __pycache__/
 *.pyd
 env/
 venv/
+.venv/
