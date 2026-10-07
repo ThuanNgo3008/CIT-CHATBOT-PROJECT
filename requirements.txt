@@ -1,0 +1,4 @@
+# CÁC THƯ VIỆN CẦN THIẾT
+fastapi
+uvicorn
+pydantic-settings

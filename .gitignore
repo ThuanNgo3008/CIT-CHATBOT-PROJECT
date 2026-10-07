@@ -42,3 +42,11 @@ build/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+.venv/

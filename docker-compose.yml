@@ -1,0 +1,49 @@
+services:
+  rag_api:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: cit_chatbot_project
+    ports:
+      - "8881:8880"
+    volumes:
+      - ./app:/app/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8880 --reload
+    restart: unless-stopped
+    networks:
+      - backend
+
+  mysql_db:
+    image: mysql:8.0
+    container_name: chatbot_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: 201026
+      MYSQL_DATABASE: chatbot_db
+    ports:
+      - "3308:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./data/init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+    networks:
+      - backend
+
+  qdrant_db:
+    image: qdrant/qdrant:latest
+    container_name: qdrant_cit_chatbot_db
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    restart: unless-stopped
+    networks:
+      - backend
+
+volumes:
+  mysql_data:
+  qdrant_storage:
+
+networks:
+  backend:
+
