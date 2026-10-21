@@ -1,4 +1,11 @@
 # CÁC THƯ VIỆN CẦN THIẾT
 fastapi
 uvicorn
+openai
+qdrant-client
+langchain
+pypdf
+sqlalchemy
+pymysql
 pydantic-settings
+langchain-text-splitters
