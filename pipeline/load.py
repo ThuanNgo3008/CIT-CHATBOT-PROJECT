@@ -1,17 +1,17 @@
 import json
 import os
 import uuid
-from dotenv import load_dotenv  # Thêm dòng này để import thư viện
+from dotenv import load_dotenv
 from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
-# Thêm dòng này để yêu cầu Python đọc file .env
+# dòng này để yêu cầu Python đọc file .env
 load_dotenv()
 
 # Lúc này os.getenv mới lấy được key
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-qdrant_client = QdrantClient(host="localhost", port=6333)
+qdrant_client = QdrantClient(url="http://qdrant_db:6333")
 
 COLLECTION_NAME = "cit_chatbot_collection"
 
