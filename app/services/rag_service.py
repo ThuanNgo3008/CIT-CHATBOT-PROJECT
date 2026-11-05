@@ -16,7 +16,7 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_TOP_K = 3
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
-qdrant = QdrantClient(url=QDRANT_URL)
+qdrant = QdrantClient(url=QDRANT_URL, api_key=os.getenv("QDRANT_API_KEY"))
 logger = logging.getLogger(__name__)
 
 # Must match the ResearchArea names in data/init.sql.
