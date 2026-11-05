@@ -1,11 +1,11 @@
 from pydantic import BaseModel, Field
-from typing import Optional
 
 
 class ChatRequest(BaseModel):
     query: str = Field(
         ...,
         min_length=1,
+        max_length=1000,
         description="Câu hỏi của sinh viên",
-        examples=["Giảng viên nào nghiên cứu trí tuệ nhân tạo"],
+        examples=["Có bao nhiêu giảng viên dạy trí tuệ nhân tạo?"], 
     )
