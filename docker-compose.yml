@@ -1,16 +1,21 @@
 services:
   rag_api:
-    build: 
+    build:
       context: .
       dockerfile: Dockerfile
     container_name: cit_chatbot_project
     ports:
-      - "8881:8880"
+      - "127.0.0.1:8881:8880"
     volumes:
       - ./app:/app/app
     env_file:
       - .env
+    environment:
+      - QDRANT_URL=http://qdrant_db:6333
     command: uvicorn app.main:app --host 0.0.0.0 --port 8880 --reload
+    depends_on:
+      qdrant_db:
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - backend
@@ -22,22 +27,44 @@ services:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
       MYSQL_DATABASE: chatbot_db
     ports:
-      - "3308:3306"
+      - "127.0.0.1:3308:3306"
     volumes:
       - mysql_data:/var/lib/mysql
       - ./data/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
     restart: unless-stopped
     networks:
       - backend
 
   qdrant_db:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.20.0
     container_name: qdrant_cit_chatbot_db
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:?Set QDRANT_API_KEY in .env}
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "127.0.0.1:6333:6333"
     volumes:
       - qdrant_storage:/qdrant/storage
+    healthcheck:
+      # The image has no curl, so send the readiness request with bash.
+      test:
+        - CMD
+        - bash
+        - -c
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/6333
+          && printf 'GET /readyz HTTP/1.0\r\n\r\n' >&3
+          && read -r status <&3
+          && [[ "$$status" == *" 200 "* ]]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     restart: unless-stopped
     networks:
       - backend

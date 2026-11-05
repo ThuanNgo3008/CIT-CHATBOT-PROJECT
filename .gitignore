@@ -52,6 +52,8 @@ venv/
 .venv311/
 
 .env
+.env.*
+!.env.example
 student_data_raw.jsonl
 student_data_chunked.jsonl
 
