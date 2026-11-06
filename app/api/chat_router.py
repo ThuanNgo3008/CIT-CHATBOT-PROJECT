@@ -35,8 +35,12 @@ def chat_with_bot(request: ChatRequest):
         filters = {}
 
     logger.info("Phân tích câu hỏi, trích xuất được bộ lọc: %s", filters)
-    answer_generator = generate_answer_stream(query=request.query, filters=filters)
 
+    answer_generator = generate_answer_stream(
+        query=request.query,
+        filters=filters,
+        session_id=str(request.session_id) if request.session_id else None,
+    )
     # The status code is sent with the first byte, so read the first chunk before that.
     try:
         first_chunk = next(answer_generator, "")

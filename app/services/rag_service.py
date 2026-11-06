@@ -2,6 +2,9 @@ import json
 import logging
 import os
 import unicodedata
+import re
+from threading import Lock
+from time import monotonic
 
 from collections.abc import Iterator
 from openai import OpenAI
@@ -254,7 +257,7 @@ phù hợp trong ngữ cảnh. Số lượng nêu ra phải bằng số mục tr
 đến câu trả lời vừa xong.
 11. Dữ liệu chỉ có lĩnh vực nghiên cứu, không có phân công giảng dạy. Khi câu hỏi nói về
 việc "dạy", hãy nêu rõ điều này và không khẳng định giảng viên đang dạy môn nào.
-
+12. Trả lời thông tin về giảng viên tuyệt đối không dùng "ông" hoặc "bà" để thay thế cho giảng viên đó.
 VÍ DỤ ĐỊNH DẠNG (tên chỉ để minh họa, không phải dữ liệu):
 Câu hỏi: "Ai làm về xử lý ảnh?"
 Trả lời:
@@ -462,6 +465,7 @@ def list_lecturers(
             lecturer_areas = payload.get("research_areas") or []
             lecturers[payload.get("parent_doc_id")] = {
                 "name": lecturer_name,
+                "major": payload.get("major"),
                 "matched_areas": [
                     area for area in requested_areas if area in lecturer_areas
                 ],
@@ -475,6 +479,70 @@ def list_lecturers(
         lecturers.values(),
         key=lambda lecturer: (-len(lecturer["matched_areas"]), lecturer["name"]),
     )
+
+# chuẩn hóa dấu hoa thường và dấu tiếng việt
+def normalize_lecturer_name(name : str) -> str:
+    normalized = unicodedata.normalize("NFD", name.casefold())
+    normalized = "".join(
+        char for char in normalized
+        if unicodedata.category(char) != "Mn"
+    )
+    return " ".join(normalized.replace("đ", "d").split())
+
+# XÁC ĐỊNH GIẢNG VIÊN TỪ TÊN RÚT GỌN HOẶC TÊN ĐẦY ĐỦ HOẶC TÊN KHÔNG DẤU HOẶC TÊN NƯỚC NGOÀI
+def resolve_lecturer_name(short_name: str) -> list[str]:
+    target = " ".join(short_name.casefold().split())
+
+    if not target:
+        return []
+
+    lecturers = list_lecturers()
+
+    def matches_name(full_name: str, name: str) -> bool:
+        return (
+            full_name == name
+            or full_name.endswith(" " + name)
+            or full_name.startswith(name + " ")
+        )
+
+    # Priority 1: Match the ending of the name with accents preserved.
+    exact_matches = [
+        lecturer["name"]
+        for lecturer in lecturers
+        if matches_name(
+            " ".join(lecturer["name"].casefold().split()),
+            target,
+        )
+    ]
+
+    if exact_matches:
+        return list(dict.fromkeys(exact_matches))
+
+    # Do not confuse an accented name with another name.
+    has_accent = (
+        "đ" in target
+        or any(
+            unicodedata.combining(char)
+            for char in unicodedata.normalize("NFD", target)
+        )
+    )
+
+    if has_accent:
+        return []
+
+    # Priority 2: Support names typed without Vietnamese accents.
+    normalized_target = normalize_lecturer_name(target)
+
+    matches = [
+        lecturer["name"]
+        for lecturer in lecturers
+        if matches_ending(
+            normalize_lecturer_name(lecturer["name"]),
+            normalized_target,
+        )
+    ]
+
+    return list(dict.fromkeys(matches))
 
 
 def format_lecturer_list(
@@ -599,9 +667,191 @@ def retrieve_context(
         logger.exception("Context retrieval failed.")
         raise
 
+# GHI NHỚ NGỮ CẢNH ĐỂ TIẾP TỤC PHIÊN TRÒ CHUYỆN
+PENDING_SELECTIONS = {}
+
+# GIẢNG VIÊN ĐANG ĐƯỢC NHẮC ĐẾN
+ACTIVE_LECTURERS = {}
+
+# HÀM XỬ LÝ LƯU GIẢNG VIÊN ĐANG ĐƯỢC NHẮC ĐẾN
+def remember_active_lecturer(session_id, name):
+    if not session_id:
+        return
+
+    with SELECTION_LOCK:
+        ACTIVE_LECTURERS[session_id] = {
+            "name": name,
+            "expires_at": monotonic() + SELECTION_TIMEOUT,
+        }
+
+# HÀM GHI NHỚ GIẢNG VIÊN ĐÓ ĐỂ DÙNG CHO CÂU HỎI TIẾP THEO LIÊN QUAN ĐẾN GIẢNG VIÊN ĐÓ
+def get_active_lecturer(session_id):
+    if not session_id:
+        return None
+
+    with SELECTION_LOCK:
+        active = ACTIVE_LECTURERS.get(session_id)
+
+        if not active:
+            return None
+
+        if active["expires_at"] <= monotonic():
+            ACTIVE_LECTURERS.pop(session_id, None)
+            return None
+
+        return active["name"]
+
+SELECTION_LOCK = Lock()
+
+SELECTION_TIMEOUT = 600  # 10 phút
+
+
+def save_pending_selection(session_id, question, candidates):
+    if not session_id:
+        return
+
+    with SELECTION_LOCK:
+        now = monotonic()
+
+        for key, value in list(PENDING_SELECTIONS.items()):
+            if value["expires_at"] <= now:
+                del PENDING_SELECTIONS[key]
+
+        if len(PENDING_SELECTIONS) >= 500:
+            oldest = min(
+                PENDING_SELECTIONS,
+                key=lambda key: PENDING_SELECTIONS[key]["expires_at"],
+            )
+            del PENDING_SELECTIONS[oldest]
+
+        PENDING_SELECTIONS[session_id] = {
+            "question": question,
+            "candidates": candidates,
+            "expires_at": now + SELECTION_TIMEOUT,
+        }
+
+
+def get_pending_selection(session_id):
+    if not session_id:
+        return None
+
+    with SELECTION_LOCK:
+        pending = PENDING_SELECTIONS.get(session_id)
+
+        if pending and pending["expires_at"] > monotonic():
+            return pending
+
+        PENDING_SELECTIONS.pop(session_id, None)
+        return None
+
+
+def clear_pending_selection(session_id):
+    if session_id:
+        with SELECTION_LOCK:
+            PENDING_SELECTIONS.pop(session_id, None)
+
+
+def choose_lecturer(message, candidates):
+    text = normalize_lecturer_name(message)
+
+    pattern = (
+        r"(?:(?:em|toi|minh)\s+)?"
+        r"(?:chon\s+)?"
+        r"(?:(?:nguoi|thay|co|giang vien)\s+)?"
+        r"(?:(?:thu|so)\s+)?"
+        r"(\d+)"
+    )
+
+    number_match = re.fullmatch(pattern, text)
+
+    if number_match:
+        index = int(number_match.group(1)) - 1
+
+        if 0 <= index < len(candidates):
+            return candidates[index], True
+
+        return None, True
+
+    text = re.sub(r"^(?:thay|co|giang vien)\s+", "", text)
+
+    matches = [
+        lecturer
+        for lecturer in candidates
+        if (
+            normalize_lecturer_name(lecturer["name"]) == text
+            or f" {text} " in (
+                f" {normalize_lecturer_name(lecturer['name'])} "
+            )
+        )
+    ] if text else []
+
+    if len(matches) == 1:
+        return matches[0], True
+
+    return None, bool(matches)
+
+# HÀM XỬ LÝ TRUY VẤN TRỰC TIẾP TRONG QDRANT ĐỂ TRẢ KẾT QUẢ KHÔNG CẦN ĐƯA GPT TẠO CÂU TRẢ LỜI
+def get_lecturer_contact_answer(
+    lecturer_name: str,
+    query: str,
+) -> str | None:
+    """Get a lecturer's contact information directly from Qdrant."""
+
+    normalized_query = normalize_lecturer_name(query)
+
+    asks_all = any(
+        phrase in normalized_query
+        for phrase in ("lien he", "lien lac", "contact")
+    )
+    asks_email = asks_all or "email" in normalized_query
+    asks_phone = asks_all or any(
+        phrase in normalized_query
+        for phrase in ("so dien thoai", "sdt", "phone")
+    )
+
+    if not asks_email and not asks_phone:
+        return None
+
+    search_filter = build_search_filter(
+        lecturer_name=lecturer_name
+    )
+
+    points, _ = qdrant.scroll(
+        collection_name=COLLECTION_NAME,
+        scroll_filter=search_filter,
+        limit=1,
+        with_payload=True,
+        with_vectors=False,
+    )
+
+    if not points:
+        return f"Không tìm thấy thông tin của giảng viên {lecturer_name}."
+
+    payload = points[0].payload or {}
+    lines = [f"Thông tin liên hệ giảng viên {lecturer_name}:"]
+
+    if asks_email:
+        email = payload.get("email")
+        if email and email.strip().lower() != "không có thông tin":
+            lines.append(f"Email: {email}")
+        else:
+            lines.append("Email: Chưa có thông tin.")
+
+    if asks_phone:
+        phone = payload.get("phone")
+        if phone and phone.strip().lower() != "không có thông tin":
+            lines.append(f"Số điện thoại: {phone}")
+        else:
+            lines.append("không tìm thấy thông tin số điện thoại, bạn có thể liên hệ qua email của giảng viên.")
+
+    return "\n".join(lines)
+
 
 def generate_answer_stream(
-    query: str, filters: dict | None = None, top_k: int = DEFAULT_TOP_K
+    query: str,
+    filters: dict | None = None,
+    top_k: int = DEFAULT_TOP_K,
+    session_id: str | None = None,
 ) -> Iterator[str]:
     """Retrieve relevant context and stream an academic advising answer."""
     query = query.strip()
@@ -612,6 +862,234 @@ def generate_answer_stream(
 
     try:
         filters = filters or {}
+
+
+        # EXACT-MATCH RETRIEVAL: TIM CHU SO HUU EMAIL / SO DIEN THOAI
+        email = (filters.get("email") or "").strip().lower()
+        phone = (
+            filters.get("phone_number")
+            or filters.get("phone")
+            or ""
+        ).strip()
+
+        normalized_question = normalize_lecturer_name(query)
+
+        asks_info_owner = any(
+            phrase in normalized_question
+            for phrase in (
+                "cua ai",
+                "cua thay co nao",
+                "cua giang vien nao",
+                "thuoc ve ai",
+                "thuoc giang vien nao",
+            )
+        )
+
+        if (email or phone) and asks_info_owner:
+            conditions = []
+
+            if email:
+                conditions.append(
+                    models.FieldCondition(
+                        key="email",
+                        match=models.MatchValue(value=email),
+                    )
+                )
+
+            if phone:
+                conditions.append(
+                    models.FieldCondition(
+                        key="phone",
+                        match=models.MatchValue(value=phone),
+                    )
+                )
+
+            search_filter = models.Filter(must=conditions)
+
+            points, _ = qdrant.scroll(
+                collection_name=COLLECTION_NAME,
+                scroll_filter=search_filter,
+                limit=100,
+                with_payload=True,
+                with_vectors=False,
+            )
+
+            names = sorted({
+                point.payload["lecturer_name"]
+                for point in points
+                if point.payload and point.payload.get("lecturer_name")
+            })
+
+            field_name = (
+                "Email và số điện thoại" if email and phone
+                else "Email" if email
+                else "Số điện thoại"
+            )
+
+            if len(names) == 1:
+                clear_pending_selection(session_id)
+                remember_active_lecturer(session_id, names[0])
+
+                yield f"{field_name} thuộc về giảng viên {names[0]}."
+
+            elif len(names) == 0:
+                yield (
+                    f"Không tìm thấy giảng viên sở hữu "
+                    f"{field_name.lower()} này trong dữ liệu."
+                )
+
+            else:
+                yield (
+                    f"{field_name} khớp với nhiều giảng viên: "
+                    + ", ".join(names)
+                    + ". Cần kiểm tra lại dữ liệu."
+                )
+
+            return
+
+
+        # Explicit Entity Override
+        # Tên giảng viên mới được ưu tiên hơn ngữ cảnh cũ.
+        explicit_name = filters.get("lecturer_name")
+
+        if explicit_name:
+            matches = resolve_lecturer_name(explicit_name)
+
+            if len(matches) == 1:
+                resolved_name = matches[0]
+
+                filters["lecturer_name"] = resolved_name
+                clear_pending_selection(session_id)
+                remember_active_lecturer(session_id, resolved_name)
+
+
+        # ghi nhớ phiên trả lời để trả đúng kết quả của phiên đó
+        pending = get_pending_selection(session_id)
+
+        normalized_query = normalize_lecturer_name(query)
+
+        is_followup = bool(re.search(
+            r"\btrong\s+(?:hai|2|nhung|cac|danh sach|so)\b"
+            r"|\b(?:hai|2)\s+(?:thay|co|giang vien)\b.*\bdo\b",
+            normalized_query
+        ))
+
+        if pending and is_followup:
+            research_areas = filters.get("research_areas") or []
+            major = filters.get("major")
+
+            if not research_areas and not major:
+                yield "Bạn muốn tìm thông tin gì về những giảng viên vừa nêu?"
+                return
+
+            matching_lecturers = list_lecturers(
+                major=major,
+                research_areas=research_areas,
+            )
+
+            matching_names = {
+                lecturer["name"]
+                for lecturer in matching_lecturers
+            }
+
+            selected = [
+                lecturer
+                for lecturer in pending["candidates"]
+                if lecturer["name"] in matching_names
+            ]
+
+            if len(selected) == 1:
+                # ghi nhớ giảng viên đã lựa chọn
+                remember_active_lecturer(session_id, selected[0]["name"])
+
+            if not selected:
+                yield (
+                    "Trong danh sách giảng viên vừa nêu, "
+                    "không có ai phù hợp với lĩnh vực hoặc chuyên ngành được hỏi."
+                )
+                return
+
+            lines = [
+                f"Trong {len(pending['candidates'])} giảng viên vừa nêu, "
+                f"có {len(selected)} người phù hợp:"
+            ]
+
+            for index, lecturer in enumerate(selected, 1):
+                lines.append(f"{index}. {lecturer['name']}")
+
+            yield "\n".join(lines)
+            return
+
+        normalized_query = normalize_lecturer_name(query)
+
+        # SỬA NGỮ CẢNH BẰNG CÁCH THÊM TỪ KHÓA CỦA CÂU HỎI MỚI
+        refers_to_previous = bool(re.search(
+            r"\b(?:thay|co|giang vien|nguoi)\s+(?:do|nay|ay)\b"
+            r"|\b(?:cua|ve)\s+(?:thay|co|giang vien)\s*$"
+            r"|\b(?:cua|ve)\s+(?:thay|co|giang vien)\s+la\s+gi\b"
+            r"|\b(?:thong tin|email|lien he)\s+(?:cua\s+)?(?:thay|co)\s*$"
+            r"|\b(?:thay|co|giang vien|nguoi)\s+(?:co|dang|tung|phu trach|huong dan)\b"
+            r"|\b(?:thay|co|giang vien|nguoi)\s+(?:chuyen|gioi|nghien cuu|linh vuc)\b",
+            normalized_query,
+))
+
+        if (
+            refers_to_previous
+            and not filters.get("lecturer_name")
+            and filters.get("query_type") not in ("list", "list_all")
+        ):
+            # lấy lại giảng viên đó cho câu hỏi liên quan tiếp theo
+            active_name = get_active_lecturer(session_id)
+
+            if not active_name:
+                yield (
+                    "Bạn đang muốn hỏi về giảng viên nào? "
+                    "Vui lòng cho biết tên giảng viên."
+                )
+                return
+
+            filters = {
+                "query_type": "other",
+                "lecturer_name": active_name,
+            }
+
+            query = f"{query}\nGiảng viên được nhắc đến: {active_name}"
+
+        # cho sinh viên lựa chọn nếu trả về nhiều kết quả
+        pending = get_pending_selection(session_id)
+
+        if pending:
+            selected, attempted = choose_lecturer(
+                query, pending["candidates"]
+            )
+
+            if attempted:
+                if selected is None:
+                    yield (
+                        "Lựa chọn chưa xác định được. "
+                        "Bạn vui lòng chọn số thứ tự hợp lệ "
+                        "hoặc cung cấp họ tên đầy đủ trong danh sách."
+                    )
+                    return
+
+                original_question = pending["question"]
+                lecturer_name = selected["name"]
+
+                # giúp ghi nhớ người được chọn để tiếp tục phiên đó
+                remember_active_lecturer(session_id, lecturer_name)
+
+                clear_pending_selection(session_id)
+
+                filters = {
+                    "query_type": "other",
+                    "lecturer_name": lecturer_name,
+                }
+                query = (
+                    f"{original_question}\n"
+                    f"Giảng viên được chọn: {lecturer_name}"
+                )
+            else:
+                clear_pending_selection(session_id)
 
         # Exhaustive questions ("Có bao nhiêu...") are answered by code, others by top-k RAG.
         query_type = filters.get("query_type")
@@ -630,9 +1108,117 @@ def generate_answer_stream(
             yield answer
             return
 
+        lecturer_name = filters.get("lecturer_name")
+
+        if lecturer_name:
+            matches = resolve_lecturer_name(lecturer_name)
+
+            if len(matches) > 1:
+                candidates = [
+                    item for item in list_lecturers()
+                    if item["name"] in matches
+                ]
+
+                save_pending_selection(session_id, query, candidates)
+
+                lines = [
+                    f"Tôi tìm thấy {len(candidates)} giảng viên "
+                    f"phù hợp với tên '{lecturer_name}':"
+                ]
+
+                for index, item in enumerate(candidates, start=1):
+                    major = item.get("major") or "Chưa có thông tin ngành"
+                    lines.append(
+                        f"{index}. {item['name']} - Ngành {major}"
+                    )
+
+                if session_id:
+                    lines.append(
+                        "\nBạn muốn xem giảng viên nào? "
+                        "Hãy trả lời bằng số thứ tự hoặc họ tên."
+                    )
+                else:
+                    lines.append(
+                        "\nBạn vui lòng cung cấp họ tên đầy đủ."
+                    )
+
+                yield "\n".join(lines)
+                return
+
+            if len(matches) == 1:
+                lecturer_name = matches[0]
+                remember_active_lecturer(session_id, lecturer_name)
+
+        if lecturer_name:
+            contact_answer = get_lecturer_contact_answer(
+                lecturer_name=lecturer_name,
+                query=query,
+            )
+
+            if contact_answer is not None:
+                remember_active_lecturer(session_id, lecturer_name)
+                yield contact_answer
+                return
+
+
+        # XÁC ĐỊNH CHÍNH XÁC LĨNH VỰC NGHIÊN CỨU CỦA GIẢNG VIÊN
+        requested_areas = filters.get("research_areas") or []
+
+        if lecturer_name and requested_areas:
+            lecturer_filter = build_search_filter(
+                lecturer_name=lecturer_name
+            )
+
+            points, _ = qdrant.scroll(
+                collection_name=COLLECTION_NAME,
+                scroll_filter=lecturer_filter,
+                limit=100,
+                with_payload=True,
+                with_vectors=False,
+            )
+
+            if points:
+                actual_areas = set()
+
+                for point in points:
+                    areas = (point.payload or {}).get("research_areas") or []
+                    if isinstance(areas, str):
+                        areas = [area.strip() for area in areas.split(",")]
+
+                    actual_areas.update(area for area in areas if area)
+
+                requested = {
+                    normalize_lecturer_name(area)
+                    for area in requested_areas
+                }
+
+                recorded = {
+                    normalize_lecturer_name(area)
+                    for area in actual_areas
+                }
+
+                actual_text = ", ".join(sorted(actual_areas)) or "chưa có thông tin"
+
+                if requested & recorded:
+                    yield (
+                        f"Có. Theo dữ liệu hiện có, giảng viên "
+                        f"{lecturer_name} nghiên cứu: {actual_text}."
+                    )
+                else:
+                    yield (
+                        f"Chưa có thông tin xác nhận giảng viên "
+                        f"{lecturer_name} nghiên cứu chuyên sâu về "
+                        f"{', '.join(requested_areas)}. "
+                        f"Các lĩnh vực được ghi nhận: {actual_text}."
+                        f"Bạn vui lòng liên hệ giảng viên {lecturer_name} để tìm hiểu thêm."
+                    )
+
+                return
+
+
         context = retrieve_context(
             query,
-            lecturer_name=filters.get("lecturer_name"),
+            lecturer_name=lecturer_name,
             major_id=filters.get("major_id"),
             major=filters.get("major"),
             research_areas=filters.get("research_areas"),

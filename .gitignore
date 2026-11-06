@@ -56,6 +56,7 @@ venv/
 !.env.example
 student_data_raw.jsonl
 student_data_chunked.jsonl
+.venv/
 
 # Local AI instructions and session documentation
 /AGENTS.md
